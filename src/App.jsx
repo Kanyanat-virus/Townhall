@@ -210,7 +210,9 @@ function App() {
 
   return (
     <div className="container-fluid">
-      <h2 className="page-title mb-4">Customer (Salesforce)</h2>
+      <h2 className="page-title mb-4">
+        Customer (Salesforce) ในสังกัด ปข.6 <span style={{ fontSize: '0.6em', fontWeight: 'normal', color: '#64748b' }}>(สถานะอัพเดทวันที่ 22 กันยายน 2569)</span>
+      </h2>
 
       {/* Summary Boxes */}
       <div className="summary-wrapper" id="summary-boxes">
