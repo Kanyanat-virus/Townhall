@@ -1,5 +1,7 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
 import Papa from 'papaparse';
+import { storageService } from './services/storageService';
+import CloudSyncModal from './components/CloudSyncModal';
 import './index.css';
 
 function App() {
@@ -7,6 +9,15 @@ function App() {
   const [isDataLoaded, setIsDataLoaded] = useState(false);
   const [error, setError] = useState(null);
   
+  // Storage & Cloud Sync states
+  const [statusMap, setStatusMap] = useState(() => storageService.getLocalStatuses());
+  const [gasUrl, setGasUrl] = useState(() => storageService.getGasUrl());
+  const [syncStatus, setSyncStatus] = useState(() => (storageService.getGasUrl() ? 'synced' : 'local-only'));
+  const [lastSyncTime, setLastSyncTime] = useState(() => storageService.getLastSyncTime());
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [toastMessage, setToastMessage] = useState(null);
+
   // Filters state
   const [limit, setLimit] = useState('50');
   const [province, setProvince] = useState('');
@@ -19,6 +30,69 @@ function App() {
   
   const [showScrollTop, setShowScrollTop] = useState(false);
 
+  // แสดง Toast แจ้งเตือน
+  const showToast = useCallback((msg) => {
+    setToastMessage(msg);
+    setTimeout(() => {
+      setToastMessage((prev) => (prev === msg ? null : prev));
+    }, 3200);
+  }, []);
+
+  // ฟังก์ชันดึงสถานะสำหรับแถวนั้นๆ (ลำดับความสำคัญ: statusMap ในเครื่อง/Cloud -> CSV ดั้งเดิม)
+  const getRowStatus = useCallback((rowIdx, originalStatus) => {
+    const entry = statusMap[rowIdx];
+    if (entry && typeof entry === 'object') return entry.status || '';
+    if (typeof entry === 'string') return entry;
+    return originalStatus || '';
+  }, [statusMap]);
+
+  // ฟังก์ชันซิงค์ข้อมูลกับ Google Apps Script Cloud
+  const syncWithCloud = useCallback(async (customUrl, notify = true) => {
+    const targetUrl = customUrl || gasUrl;
+    if (!targetUrl) return;
+
+    setIsSyncing(true);
+    setSyncStatus('syncing');
+
+    try {
+      const cloudData = await storageService.fetchCloudStatuses(targetUrl);
+      
+      // ผสานข้อมูล Cloud เข้ากับ Local
+      setStatusMap(prevMap => {
+        const merged = { ...prevMap };
+        for (const [rIdx, val] of Object.entries(cloudData)) {
+          const localItem = merged[rIdx];
+          const cloudTime = val.updatedAt ? new Date(val.updatedAt).getTime() : 0;
+          const localTime = localItem && localItem.updatedAt ? new Date(localItem.updatedAt).getTime() : 0;
+
+          // ถ้า Cloud ใหม่กว่า หรือ Local ยังไม่มี ให้ใช้ Cloud
+          if (!localItem || cloudTime >= localTime) {
+            merged[rIdx] = val;
+          }
+        }
+        storageService.saveLocalStatuses(merged);
+        return merged;
+      });
+
+      const now = new Date();
+      setLastSyncTime(now.toISOString());
+      storageService.setLastSyncTime(now);
+      setSyncStatus('synced');
+      if (notify) {
+        showToast('🟢 ซิงค์ข้อมูลเรียบร้อยแล้ว');
+      }
+    } catch (err) {
+      console.error('Cloud sync error:', err);
+      setSyncStatus('error');
+      if (notify) {
+        showToast('⚠️ ไม่สามารถซิงค์ได้ (บันทึกในเครื่องปลอดภัย)');
+      }
+    } finally {
+      setIsSyncing(false);
+    }
+  }, [gasUrl, showToast]);
+
+  // โหลดข้อมูล CSV จาก Google Sheets
   useEffect(() => {
     const fetchData = async () => {
       try {
@@ -111,14 +185,109 @@ function App() {
     return () => window.removeEventListener('scroll', handleScroll);
   }, []);
 
+  // ซิงค์ Cloud ครั้งแรกเมื่อโหลดแอป และตั้งเวลา Auto-Sync ทุก 30 วินาที
+  useEffect(() => {
+    if (!gasUrl) return;
+
+    let isMounted = true;
+    const initialSync = async () => {
+      try {
+        const cloudData = await storageService.fetchCloudStatuses(gasUrl);
+        if (!isMounted) return;
+
+        setStatusMap(prevMap => {
+          const merged = { ...prevMap };
+          for (const [rIdx, val] of Object.entries(cloudData)) {
+            const localItem = merged[rIdx];
+            const cloudTime = val.updatedAt ? new Date(val.updatedAt).getTime() : 0;
+            const localTime = localItem && localItem.updatedAt ? new Date(localItem.updatedAt).getTime() : 0;
+
+            if (!localItem || cloudTime >= localTime) {
+              merged[rIdx] = val;
+            }
+          }
+          storageService.saveLocalStatuses(merged);
+          return merged;
+        });
+
+        const now = new Date();
+        setLastSyncTime(now.toISOString());
+        storageService.setLastSyncTime(now);
+        setSyncStatus('synced');
+      } catch (err) {
+        if (!isMounted) return;
+        console.warn('Initial cloud sync error:', err);
+        setSyncStatus('error');
+      }
+    };
+
+    initialSync();
+
+    const interval = setInterval(() => {
+      if (storageService.isAutoSyncEnabled() && document.visibilityState === 'visible') {
+        syncWithCloud(gasUrl, false);
+      }
+    }, 30000);
+
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
+  }, [gasUrl, syncWithCloud]);
+
   const scrollToTop = () => {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  const handleStatusChange = (rowIdx, newStatus) => {
-    setAllData(prevData => prevData.map(item => 
-      item.rowIdx === rowIdx ? { ...item, salesforceStatus: newStatus } : item
-    ));
+  // จัดการการเปลี่ยนสถานะ: อัปเดต State + บันทึก LocalStorage + ซิงค์ Cloud ทันที
+  const handleStatusChange = async (item, newStatus) => {
+    const updatedEntry = {
+      status: newStatus,
+      updatedAt: new Date().toISOString(),
+      accountName: item.accountName,
+      fullAccountName: item.fullAccountName,
+      province: item.province,
+      poName: item.poName,
+      zip: item.zip
+    };
+
+    // 1. อัปเดต React State ทันที ไม่ต้องรอเครือข่าย
+    const nextMap = {
+      ...statusMap,
+      [item.rowIdx]: updatedEntry
+    };
+    setStatusMap(nextMap);
+
+    // 2. บันทึกลงในเครื่อง (LocalStorage) ทันที - รีเฟรชจะไม่หายเด็ดขาด
+    storageService.saveLocalStatuses(nextMap);
+
+    // 3. ส่งข้อมูลขึ้น Cloud ถ้ามีการตั้งค่า Google Apps Script Web App ไว้
+    if (gasUrl) {
+      setSyncStatus('syncing');
+      showToast('💾 กำลังบันทึก...');
+      try {
+        await storageService.saveStatusToCloud(gasUrl, {
+          rowIdx: item.rowIdx,
+          status: newStatus,
+          accountName: item.fullAccountName || item.accountName,
+          province: item.province,
+          poName: item.poName,
+          zip: item.zip
+        });
+        setSyncStatus('synced');
+        const now = new Date();
+        setLastSyncTime(now.toISOString());
+        storageService.setLastSyncTime(now);
+        showToast('✅ บันทึกเรียบร้อยแล้ว');
+      } catch (err) {
+        console.error('Error syncing status to cloud:', err);
+        setSyncStatus('error');
+        showToast('⚠️ บันทึกในเครื่องแล้ว');
+      }
+    } else {
+      setSyncStatus('local-only');
+      showToast('✅ บันทึกเรียบร้อยแล้ว');
+    }
   };
 
   const resetFilters = () => {
@@ -132,17 +301,17 @@ function App() {
     setLimit('50');
   };
 
-  // 1. ทำให้ตัวกรองสัมพันธ์กัน
-  // ล้างค่า PO และ Zip เมื่อเปลี่ยน Province
-  useEffect(() => {
+  // ตัวกรองสัมพันธ์กัน
+  const handleProvinceChange = (newProvince) => {
+    setProvince(newProvince);
     setPo('');
     setZip('');
-  }, [province]);
+  };
 
-  // ล้างค่า Zip เมื่อเปลี่ยน PO
-  useEffect(() => {
+  const handlePoChange = (newPo) => {
+    setPo(newPo);
     setZip('');
-  }, [po]);
+  };
 
   const provinces = useMemo(() => [...new Set(allData.map(item => item.province))].filter(Boolean).sort(), [allData]);
   
@@ -161,7 +330,7 @@ function App() {
 
   const tiers = useMemo(() => [...new Set(allData.map(item => item.tier))].filter(Boolean).sort(), [allData]);
 
-  // Derived filtered data
+  // คำนวณข้อมูลที่ถูกกรอง (Filtered Data)
   const filteredData = useMemo(() => {
     if (!isDataLoaded) return [];
 
@@ -171,9 +340,10 @@ function App() {
       if (diff === 'down-slight') matchDiff = item.diffPercent <= 0 && item.diffPercent >= -20;
       if (diff === 'down-heavy') matchDiff = item.diffPercent < -20;
 
+      const currentStatus = getRowStatus(item.rowIdx, item.salesforceStatus);
       let matchStatus = true;
-      if (status === 'ยังไม่ระบุ') matchStatus = (item.salesforceStatus === '' || !item.salesforceStatus);
-      else if (status) matchStatus = (item.salesforceStatus === status);
+      if (status === 'ยังไม่ระบุ') matchStatus = (!currentStatus || currentStatus === '');
+      else if (status) matchStatus = (currentStatus === status);
 
       return (!province || item.province === province) &&
              (!po || item.poName === po) &&
@@ -184,23 +354,31 @@ function App() {
              matchDiff;
     });
 
-    // เรียงลำดับตาม Spend 2025 มากไปน้อย (Descending)
+    // เรียงลำดับตาม Spend 2025 มากไปน้อย
     filtered.sort((a, b) => b.spend2025 - a.spend2025);
 
     return filtered;
-  }, [allData, isDataLoaded, province, po, zip, tier, searchName, status, diff]);
+  }, [allData, isDataLoaded, province, po, zip, tier, searchName, status, diff, getRowStatus]);
 
-  // Derived summary data
+  // คำนวณสรุปจำนวนตามสถานะล่าสุด
   const summaryData = useMemo(() => {
     const total = filteredData.length;
-    const done = filteredData.filter(d => d.salesforceStatus === 'ดำเนินการแล้ว').length;
-    const prog = filteredData.filter(d => d.salesforceStatus === 'กำลังดำเนินการ').length;
-    const fail = filteredData.filter(d => d.salesforceStatus === 'ไม่สามารถดำเนินการได้').length;
+    let done = 0;
+    let prog = 0;
+    let fail = 0;
+
+    for (let i = 0; i < filteredData.length; i++) {
+      const s = getRowStatus(filteredData[i].rowIdx, filteredData[i].salesforceStatus);
+      if (s === 'ดำเนินการแล้ว') done++;
+      else if (s === 'กำลังดำเนินการ') prog++;
+      else if (s === 'ไม่สามารถดำเนินการได้') fail++;
+    }
+
     const empty = total - (done + prog + fail);
     return { total, done, prog, fail, empty };
-  }, [filteredData]);
+  }, [filteredData, getRowStatus]);
 
-  // Apply limit
+  // ตัดข้อมูลตาม Limit
   const displayData = useMemo(() => {
     if (limit !== 'all') {
       return filteredData.slice(0, parseInt(limit));
@@ -210,9 +388,50 @@ function App() {
 
   return (
     <div className="container-fluid">
-      <h2 className="page-title mb-4">
-        Customer (Salesforce) ในสังกัด ปข.6 <span style={{ fontSize: '0.6em', fontWeight: 'normal', color: '#64748b' }}>(สถานะอัพเดทวันที่ 22 กันยายน 2569)</span>
-      </h2>
+      {/* Header with Title and Sync Controls */}
+      <div className="header-wrapper">
+        <h2 className="page-title">
+          Customer (Salesforce) ในสังกัด ปข.6 
+          <span style={{ fontSize: '0.6em', fontWeight: 'normal', color: '#64748b' }}>
+            (สถานะอัพเดทวันที่ 22 กันยายน 2569)
+          </span>
+        </h2>
+
+        <div className="header-actions">
+          {/* Cloud Sync Status Indicator (Icon only) */}
+          <div 
+            className={`sync-badge ${syncStatus}`}
+            title={
+              syncStatus === 'synced' ? 'เชื่อมต่อ Cloud แล้ว' :
+              syncStatus === 'syncing' ? 'กำลังซิงค์ข้อมูล...' :
+              syncStatus === 'error' ? 'การเชื่อมต่อขัดข้อง (บันทึกในเครื่องปลอดภัย)' :
+              'บันทึกในเครื่องแล้ว'
+            }
+          >
+            {syncStatus === 'synced' && <span style={{ fontSize: '0.9rem' }}>🟢</span>}
+            {syncStatus === 'syncing' && (
+              <span className="spinner-border spinner-border-sm" role="status" style={{ width: '14px', height: '14px' }}></span>
+            )}
+            {syncStatus === 'local-only' && <span style={{ fontSize: '0.9rem' }}>🟡</span>}
+            {syncStatus === 'error' && <span style={{ fontSize: '0.9rem' }}>⚠️</span>}
+          </div>
+
+          {/* Sync Now Button (Icon only) */}
+          {gasUrl && (
+            <button
+              className="btn btn-outline-primary btn-icon-circle"
+              onClick={() => syncWithCloud(gasUrl, true)}
+              disabled={isSyncing}
+              title="ซิงค์ข้อมูลล่าสุด"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16" className={isSyncing ? 'spin-icon' : ''}>
+                <path fillRule="evenodd" d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"/>
+                <path d="M8 4.466V.534a.25.25 0 0 1 .41-.192L10.77 2.308a.25.25 0 0 1 0 .384l-2.36 1.966A.25.25 0 0 1 8 4.466z"/>
+              </svg>
+            </button>
+          )}
+        </div>
+      </div>
 
       {/* Summary Boxes */}
       <div className="summary-wrapper" id="summary-boxes">
@@ -233,11 +452,11 @@ function App() {
             <option value="all">แสดงทั้งหมด</option>
           </select>
           
-          <select value={province} onChange={(e) => setProvince(e.target.value)} className="pill-input">
+          <select value={province} onChange={(e) => handleProvinceChange(e.target.value)} className="pill-input">
             <option value="">Province</option>
             {provinces.map(p => <option key={p} value={p}>{p}</option>)}
           </select>
-          <select value={po} onChange={(e) => setPo(e.target.value)} className="pill-input">
+          <select value={po} onChange={(e) => handlePoChange(e.target.value)} className="pill-input">
             <option value="">Post Office</option>
             {pos.map(p => <option key={p} value={p}>{p}</option>)}
           </select>
@@ -315,10 +534,12 @@ function App() {
 
                   let diffColor = item.diffPercent >= 0 ? 'text-success' : 'text-danger';
 
+                  const currentStatus = getRowStatus(item.rowIdx, item.salesforceStatus);
+
                   let selectClass = 'status-select ';
-                  if (item.salesforceStatus === 'ดำเนินการแล้ว') selectClass += 'done';
-                  else if (item.salesforceStatus === 'กำลังดำเนินการ') selectClass += 'progress';
-                  else if (item.salesforceStatus === 'ไม่สามารถดำเนินการได้') selectClass += 'fail';
+                  if (currentStatus === 'ดำเนินการแล้ว') selectClass += 'done';
+                  else if (currentStatus === 'กำลังดำเนินการ') selectClass += 'progress';
+                  else if (currentStatus === 'ไม่สามารถดำเนินการได้') selectClass += 'fail';
                   else selectClass += 'empty';
 
                   return (
@@ -336,8 +557,8 @@ function App() {
                       <td>
                         <select 
                           className={selectClass} 
-                          value={item.salesforceStatus || ""}
-                          onChange={(e) => handleStatusChange(item.rowIdx, e.target.value)}
+                          value={currentStatus}
+                          onChange={(e) => handleStatusChange(item, e.target.value)}
                         >
                           <option value="">- เลือกสถานะ -</option>
                           <option value="ดำเนินการแล้ว">ดำเนินการแล้ว</option>
@@ -359,6 +580,26 @@ function App() {
           ↑ ขึ้นบนสุด
         </button>
       )}
+
+      {/* Floating Toast Notification */}
+      {toastMessage && (
+        <div className="toast-feedback">
+          {toastMessage}
+        </div>
+      )}
+
+      {/* Cloud Sync Settings Modal */}
+      <CloudSyncModal
+        isOpen={showSettingsModal}
+        onClose={() => setShowSettingsModal(false)}
+        statusMap={statusMap}
+        setStatusMap={setStatusMap}
+        gasUrl={gasUrl}
+        setGasUrl={setGasUrl}
+        onSyncNow={syncWithCloud}
+        isSyncing={isSyncing}
+        lastSyncTime={lastSyncTime}
+      />
     </div>
   );
 }
